@@ -2,6 +2,8 @@ import os
 import json
 import sqlite3
 import datetime
+import threading
+import queue
 from typing import Optional, Dict, Any, List, Union
 
 class VirtualBroker:
@@ -17,6 +19,10 @@ class VirtualBroker:
         self.initial_deposit = config.get('initial_deposit_per_strategy', 100.0)
 
         self._init_db()
+        self._db_queue: queue.Queue = queue.Queue()
+        self._stop_db_event = threading.Event()
+        self._db_thread = threading.Thread(target=self._db_worker, daemon=True)
+        self._db_thread.start()
         self.state = self._load_or_init_state()
 
     def _init_db(self):
@@ -27,6 +33,42 @@ class VirtualBroker:
         cur.execute('CREATE TABLE IF NOT EXISTS equity_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, strategy TEXT NOT NULL, wallet_balance REAL NOT NULL, unrealized_pnl REAL NOT NULL, total_equity REAL NOT NULL)')
         conn.commit()
         conn.close()
+
+    def _db_worker(self):
+        """Фоновый рабочий поток для асинхронной записи в SQLite без блокировки тикового цикла."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        cur = conn.cursor()
+        while not self._stop_db_event.is_set():
+            try:
+                task = self._db_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+            query, params = task
+            try:
+                cur.execute(query, params)
+                conn.commit()
+            except Exception as e:
+                print(f"[VirtualBroker DB Error] {e}")
+            finally:
+                self._db_queue.task_done()
+        conn.close()
+
+    def _enqueue_db_write(self, query: str, params: tuple):
+        """Добавление SQL-запроса в потокобезопасную очередь."""
+        self._db_queue.put((query, params))
+
+    def flush_db(self):
+        """Ожидание завершения всех фоновых записей в БД."""
+        self._db_queue.join()
+
+    def close(self):
+        """Остановка фонового потока БД."""
+        self._stop_db_event.set()
+        self._db_queue.put(None)
+        if self._db_thread.is_alive():
+            self._db_thread.join(timeout=2.0)
 
     def _load_or_init_state(self) -> Dict[str, Any]:
         default_strategies = ['DLH', 'HRB', 'ARGUS', 'JAZZ']
@@ -43,7 +85,7 @@ class VirtualBroker:
                 'accounts': {},
                 'positions': {},
                 'pending_orders': {},
-                'updated_at': datetime.datetime.utcnow().isoformat()
+                'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
 
         # Гарантируем присутствие всех поддерживаемых стратегий
@@ -83,7 +125,7 @@ class VirtualBroker:
     def _save_state(self, state: Optional[Dict[str, Any]] = None):
         if state is None:
             state = self.state
-        state['updated_at'] = datetime.datetime.utcnow().isoformat()
+        state['updated_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
         with open(self.state_path, 'w', encoding='utf-8') as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
@@ -126,8 +168,8 @@ class VirtualBroker:
             'direction': direction,
             'size': size,
             'entry_price': round(price, 2),
-            'entry_time': datetime.datetime.utcnow().isoformat(),
-            'entry_time_ms': int(datetime.datetime.utcnow().timestamp() * 1000),
+            'entry_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'entry_time_ms': int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000),
             'sl': round(sl, 2) if sl else None,
             'tp': round(tp, 2) if tp else None,
             'initial_sl': round(sl, 2) if sl else None,
@@ -206,15 +248,14 @@ class VirtualBroker:
         if net_pnl > 0:
             account['wins_count'] += 1
 
-        exit_time = datetime.datetime.utcnow().isoformat()
+        exit_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
         entry_fee = pos.get('entry_fee', 0.0) or 0.0
         total_fees = entry_fee * partial_ratio + exit_fee
 
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute('INSERT INTO trades (strategy, direction, size, entry_time, entry_price, exit_time, exit_price, exit_reason, pnl_gross, fees_paid, pnl_net, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (strategy, direction, close_size, pos['entry_time'], pos['entry_price'], exit_time, round(price, 2), reason, round(gross_pnl, 4), round(total_fees, 4), round(net_pnl, 4), pos.get('notes', '')))
-        conn.commit()
-        conn.close()
+        self._enqueue_db_write(
+            'INSERT INTO trades (strategy, direction, size, entry_time, entry_price, exit_time, exit_price, exit_reason, pnl_gross, fees_paid, pnl_net, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (strategy, direction, close_size, pos['entry_time'], pos['entry_price'], exit_time, round(price, 2), reason, round(gross_pnl, 4), round(total_fees, 4), round(net_pnl, 4), pos.get('notes', ''))
+        )
 
         if partial_ratio >= 0.999:
             self.state['positions'][strategy] = None
@@ -246,9 +287,7 @@ class VirtualBroker:
             return last_price >= (limit_price + self.limit_penetration)
 
     def record_equity_snapshot(self, current_prices: Union[Dict[str, float], float]):
-        now_str = datetime.datetime.utcnow().isoformat()
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
+        now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         for strat, acc in self.state['accounts'].items():
             pos = self.state['positions'].get(strat)
@@ -267,10 +306,7 @@ class VirtualBroker:
                     unrealized = (pos['entry_price'] - strat_price) * pos['size']
 
             total_eq = acc['wallet_balance'] + unrealized
-            cur.execute(
+            self._enqueue_db_write(
                 'INSERT INTO equity_snapshots (timestamp, strategy, wallet_balance, unrealized_pnl, total_equity) VALUES (?, ?, ?, ?, ?)',
                 (now_str, strat, round(acc['wallet_balance'], 4), round(unrealized, 4), round(total_eq, 4))
             )
-
-        conn.commit()
-        conn.close()
