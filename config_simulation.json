@@ -28,7 +28,7 @@
     "enabled": true,
     "timeframe": "15m",
     "hub_zmq_endpoint": "tcp://127.0.0.1:5555",
-    "require_hub_trend": true,
+    "require_hub_trend": false,
     "donchian_period": 20,
     "min_body_ratio": 0.6,
     "min_volume_ratio": 1.8,
@@ -67,11 +67,11 @@
     "min_sl_usdt": 12.0,
     "max_sl_usdt": 24.0,
     "breakeven_trigger_usdt": 10.0,
-    "breakeven_lock_usdt": 1.0,
-    "trailing_activation_usdt": 14.0,
-    "wide_buffer_usdt": 8.0,
-    "compressed_buffer_usdt": 4.0,
-    "compression_threshold_usdt": 16.0,
+    "breakeven_lock_usdt": 0.3,
+    "trailing_activation_usdt": 6.5,
+    "wide_buffer_usdt": 5.0,
+    "compressed_buffer_usdt": 3.0,
+    "compression_threshold_usdt": 10.0,
     "step_quant_usdt": 0.5
   }
 }
